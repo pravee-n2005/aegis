@@ -1,0 +1,21 @@
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# Workspace / runtime artifacts
+backend/workspace/*
+!backend/workspace/sample_brief.md
+
+# OS / editor cruft
+.DS_Store
+*.swp
