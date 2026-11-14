@@ -1,11 +1,13 @@
 import json
 from anthropic import Anthropic
+from . import context
+from . import memory
 from .config import settings
 from .tools import safe_calculate, search_workspace
 from .tracing import content_length, new_request_id, write_trace
 from .skills import (
     LOAD_SKILL_TOOL, discover_skills, format_skills_prompt, load_skill,
-    scope_tools, EVENT_LOADED, EVENT_TOOL_SCOPING,
+    scope_tools, scope_tools_by_names, EVENT_LOADED, EVENT_TOOL_SCOPING,
 )
 
 SYSTEM_PROMPT = (
@@ -40,11 +42,27 @@ def _run_tool(name, args, request_id, skill_ctx):
         return {"error": outcome["error"]}
     return {"error": "Unknown tool"}
 
-def ask_aegis(message, history=None):
+def _seed_history_if_empty(session_id, history, request_id):
+    """Legacy backward-compat path: a caller that never adopts session_id
+    keeps resending the full history on every call, each time against a
+    brand-new session (this is the only time this runs - a session with
+    messages already persisted is never reseeded)."""
+    if not history or context.get_messages(session_id):
+        return
+    for item in history:
+        try:
+            role, content = item["role"], item["content"]
+        except (KeyError, TypeError):
+            continue
+        context.append_message(session_id, role, content, request_id=request_id)
+
+def ask_aegis(session_id, message, history=None):
     request_id = new_request_id()
     client = Anthropic(api_key=settings.anthropic_api_key)
-    messages = list(history or [])
-    messages.append({"role": "user", "content": message})
+
+    _seed_history_if_empty(session_id, history, request_id)
+    context.append_message(session_id, "user", message, request_id=request_id)
+    system_prompt_addition, messages = context.build_context(session_id, request_id=request_id)
     trace = []
 
     known_tools = {tool["name"] for tool in TOOLS}
@@ -54,7 +72,27 @@ def ask_aegis(message, history=None):
     skills_block = format_skills_prompt(skills)
     if skills_block:
         system_prompt = f"{SYSTEM_PROMPT}\n\n{skills_block}"
-    current_tools = TOOLS + [LOAD_SKILL_TOOL] if skills else TOOLS
+    if system_prompt_addition:
+        system_prompt = f"{system_prompt}\n\n{system_prompt_addition}"
+
+    persisted_allowed_tools = context.get_skill_state(session_id)
+    if persisted_allowed_tools is context.UNSET:
+        current_tools = TOOLS + [LOAD_SKILL_TOOL] if skills else TOOLS
+    else:
+        scoped, denied = scope_tools_by_names(TOOLS, persisted_allowed_tools)
+        # A persisted deny-all (or any) scope must never also deny the model
+        # the ability to call load_skill and switch away - Outside Voice
+        # finding 1. ALREADY_LOADED still fires correctly within this
+        # request only, since skill_ctx["loaded"] always starts None below.
+        current_tools = scoped + [LOAD_SKILL_TOOL] if skills else scoped
+
+    def _finalize(answer_text, stop_reason):
+        maybe_summarize_ok = context.maybe_summarize(session_id, client, request_id=request_id)
+        memory.extract_memories(session_id, message, request_id=request_id)
+        write_trace("final", request_id, stop_reason=stop_reason,
+                     tool_calls=len(trace), answer_length=len(answer_text),
+                     summarized=maybe_summarize_ok)
+        return {"answer": answer_text, "trace": trace, "stop_reason": stop_reason}
 
     for _ in range(settings.max_tool_rounds):
         create_kwargs = {"model": settings.anthropic_model, "max_tokens": 1200,
@@ -65,14 +103,12 @@ def ask_aegis(message, history=None):
             create_kwargs["tools"] = current_tools
         response = client.messages.create(**create_kwargs)
         messages.append({"role": "assistant", "content": response.content})
+        context.append_message(session_id, "assistant", response.content, request_id=request_id)
         if response.stop_reason != "tool_use":
             answer = "\n".join(
                 block.text for block in response.content
                 if getattr(block, "type", None) == "text")
-            write_trace("final", request_id, stop_reason=response.stop_reason,
-                         tool_calls=len(trace), answer_length=len(answer))
-            return {"answer": answer, "trace": trace,
-                    "stop_reason": response.stop_reason}
+            return _finalize(answer, response.stop_reason)
         loaded_before = skill_ctx["loaded"]
         tool_results = []
         for block in response.content:
@@ -90,12 +126,14 @@ def ask_aegis(message, history=None):
             tool_results.append({"type": "tool_result", "tool_use_id": block.id,
                                  "content": json.dumps(result, default=str)})
         messages.append({"role": "user", "content": tool_results})
+        context.append_message(session_id, "user", tool_results, request_id=request_id)
         if loaded_before is None and skill_ctx["loaded"] is not None:
             current_tools, denied = scope_tools(TOOLS, skill_ctx["loaded"])
+            context.set_skill_state(session_id, skill_ctx["loaded"].allowed_tools, request_id=request_id)
             write_trace(EVENT_TOOL_SCOPING, request_id,
                         reason="TOOL_DENIED" if denied else "TOOL_ALLOWED",
                         skill=skill_ctx["loaded"].name, denied_tools=denied)
     write_trace("round_limit", request_id, tool_calls=len(trace),
                 max_tool_rounds=settings.max_tool_rounds)
-    return {"answer": "Tool-use limit reached. Narrow the task or ask me to continue.",
-            "trace": trace, "stop_reason": "tool_round_limit"}
+    return _finalize("Tool-use limit reached. Narrow the task or ask me to continue.",
+                      "tool_round_limit")

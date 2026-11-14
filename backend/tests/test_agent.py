@@ -6,9 +6,10 @@ import pytest
 
 os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
 
-from app import tracing  # noqa: E402
+from app import db, tracing  # noqa: E402
 from app.agent import ask_aegis, TOOLS  # noqa: E402
 from app.config import settings  # noqa: E402
+from app.context import create_session  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -24,6 +25,19 @@ def isolate_skills_dir(tmp_path, monkeypatch):
     into this same directory. Mirrors isolate_trace_file's pattern."""
     monkeypatch.setattr(settings, "skills_dir", str(tmp_path / "skills"))
     return tmp_path / "skills"
+
+
+@pytest.fixture(autouse=True)
+def isolate_db(tmp_path, monkeypatch):
+    """Point db_path at a fresh tmp file per test and initialize its schema -
+    mirrors isolate_trace_file's pattern so M3 state never touches the real
+    backend/.data/aegis.db or leaks between tests."""
+    monkeypatch.setattr(settings, "db_path", str(tmp_path / "aegis.db"))
+    db.init_db()
+
+
+def _session():
+    return create_session()
 
 
 def _write_skill(skills_dir, dirname, name, description, allowed_tools=None, body="Follow these instructions."):
@@ -63,7 +77,7 @@ def test_normal_response(mock_anthropic):
     mock_anthropic.return_value = _mock_client([
         _response([_text_block("Hello there.")], "end_turn"),
     ])
-    result = ask_aegis("Hi")
+    result = ask_aegis(_session(), "Hi")
     assert result["answer"] == "Hello there."
     assert result["trace"] == []
     assert result["stop_reason"] == "end_turn"
@@ -75,7 +89,7 @@ def test_successful_tool_execution(mock_anthropic):
         _response([_tool_use_block("calculator", {"expression": "2 + 2"})], "tool_use"),
         _response([_text_block("The result is 4.")], "end_turn"),
     ])
-    result = ask_aegis("What is 2 + 2?")
+    result = ask_aegis(_session(), "What is 2 + 2?")
     assert result["answer"] == "The result is 4."
     assert result["stop_reason"] == "end_turn"
     assert len(result["trace"]) == 1
@@ -89,7 +103,7 @@ def test_tool_execution_failure(mock_anthropic):
         _response([_tool_use_block("calculator", {"expression": "__import__('os')"})], "tool_use"),
         _response([_text_block("I could not evaluate that expression.")], "end_turn"),
     ])
-    result = ask_aegis("Run some code for me")
+    result = ask_aegis(_session(), "Run some code for me")
     assert len(result["trace"]) == 1
     assert "error" in result["trace"][0]["result"]
     assert result["answer"] == "I could not evaluate that expression."
@@ -99,7 +113,7 @@ def test_tool_execution_failure(mock_anthropic):
 def test_max_tool_round_exhaustion(mock_anthropic):
     tool_round = _response([_tool_use_block("calculator", {"expression": "1 + 1"})], "tool_use")
     mock_anthropic.return_value = _mock_client([tool_round, tool_round, tool_round, tool_round])
-    result = ask_aegis("Keep calculating forever")
+    result = ask_aegis(_session(), "Keep calculating forever")
     assert result["stop_reason"] == "tool_round_limit"
     assert result["answer"].startswith("Tool-use limit reached")
     assert len(result["trace"]) == 4
@@ -115,7 +129,7 @@ def test_m1_regression_no_skills_directory(mock_anthropic):
     mock_client = _mock_client([_response([_text_block("Hello there.")], "end_turn")])
     mock_anthropic.return_value = mock_client
     from app.agent import SYSTEM_PROMPT
-    result = ask_aegis("Hi")
+    result = ask_aegis(_session(), "Hi")
     assert result["answer"] == "Hello there."
     call = mock_client.messages.create.call_args
     assert call.kwargs["tools"] == TOOLS
@@ -127,7 +141,7 @@ def test_skill_metadata_injected_when_skill_exists(mock_anthropic, isolate_skill
     _write_skill(isolate_skills_dir, "demo", "demo-skill", "A demo skill for testing.")
     mock_client = _mock_client([_response([_text_block("Hi.")], "end_turn")])
     mock_anthropic.return_value = mock_client
-    ask_aegis("Hello")
+    ask_aegis(_session(), "Hello")
     call = mock_client.messages.create.call_args
     assert "demo-skill" in call.kwargs["system"]
     assert "A demo skill for testing." in call.kwargs["system"]
@@ -139,7 +153,7 @@ def test_skill_metadata_never_includes_body(mock_anthropic, isolate_skills_dir):
     _write_skill(isolate_skills_dir, "demo", "demo-skill", "A demo skill.", body="TOP SECRET INSTRUCTIONS")
     mock_client = _mock_client([_response([_text_block("Hi.")], "end_turn")])
     mock_anthropic.return_value = mock_client
-    ask_aegis("Hello")
+    ask_aegis(_session(), "Hello")
     call = mock_client.messages.create.call_args
     assert "TOP SECRET INSTRUCTIONS" not in call.kwargs["system"]
 
@@ -153,7 +167,7 @@ def test_load_skill_scopes_tools_for_next_round(mock_anthropic, isolate_skills_d
         _response([_text_block("Done.")], "end_turn"),
     ])
     mock_anthropic.return_value = mock_client
-    result = ask_aegis("Use the demo skill")
+    result = ask_aegis(_session(), "Use the demo skill")
     assert result["answer"] == "Done."
     first_call, second_call = mock_client.messages.create.call_args_list
     assert sorted(_tool_names(first_call)) == ["calculator", "load_skill", "search_workspace"]
@@ -171,7 +185,7 @@ def test_load_skill_empty_allowlist_denies_all_tools(mock_anthropic, isolate_ski
         _response([_text_block("Done.")], "end_turn"),
     ])
     mock_anthropic.return_value = mock_client
-    ask_aegis("Use the demo skill")
+    ask_aegis(_session(), "Use the demo skill")
     _, second_call = mock_client.messages.create.call_args_list
     assert _tool_names(second_call) == []
     # omitted entirely, not an explicit [] — some SDKs/APIs treat them differently
@@ -186,7 +200,7 @@ def test_load_skill_name_mismatch_returns_error(mock_anthropic, isolate_skills_d
         _response([_text_block("Could not find that skill.")], "end_turn"),
     ])
     mock_anthropic.return_value = mock_client
-    result = ask_aegis("Load a skill that doesn't exist")
+    result = ask_aegis(_session(), "Load a skill that doesn't exist")
     assert "error" in result["trace"][0]["result"]
     _, second_call = mock_client.messages.create.call_args_list
     # no skill was loaded, so load_skill is still offered on the next round
@@ -205,7 +219,7 @@ def test_second_load_skill_call_in_same_round_rejected(mock_anthropic, isolate_s
         _response([_text_block("Done.")], "end_turn"),
     ])
     mock_anthropic.return_value = mock_client
-    result = ask_aegis("Load two skills")
+    result = ask_aegis(_session(), "Load two skills")
     first, second = result["trace"]
     assert first["result"] == {"instructions": "Follow these instructions."}
     assert "error" in second["result"]
@@ -220,7 +234,7 @@ def test_trace_includes_skill_lifecycle_events(mock_anthropic, isolate_skills_di
         _response([_text_block("Done.")], "end_turn"),
     ])
     mock_anthropic.return_value = mock_client
-    ask_aegis("Use the demo skill")
+    ask_aegis(_session(), "Use the demo skill")
     import json
     records = [json.loads(line) for line in tracing.TRACE_PATH.read_text().splitlines()]
     events = {r["event"] for r in records}

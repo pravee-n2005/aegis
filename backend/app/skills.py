@@ -122,13 +122,23 @@ def load_skill(name: str, skills: list, already_loaded) -> dict:
     return {"error": f"No skill named {name!r} was discovered.", "reason": "LOAD_ERROR"}
 
 
+def scope_tools_by_names(base_tools: list, allowed_tools):
+    """Intersect base_tools with a raw allowed-tools value (None/[]/list) -
+    the shared core scope_tools() wraps for a DiscoveredSkill, and that
+    session-persisted skill state (M3, a name string is not enough to
+    reconstruct this - see context.get_skill_state) also calls directly with
+    its stored value. Returns (scoped_tools, denied_names). None means
+    unrestricted access; an empty list means deny-all."""
+    if allowed_tools is None:
+        return base_tools, []
+    allowed = set(allowed_tools)
+    scoped = [t for t in base_tools if t["name"] in allowed]
+    denied = [t["name"] for t in base_tools if t["name"] not in allowed]
+    return scoped, denied
+
+
 def scope_tools(base_tools: list, skill: DiscoveredSkill):
     """Intersect base_tools (Anthropic tool-schema dicts) with a loaded skill's
     allowed-tools. Returns (scoped_tools, denied_names). None/omitted allowed-tools
     means unrestricted access; an empty list means deny-all."""
-    if skill.allowed_tools is None:
-        return base_tools, []
-    allowed = set(skill.allowed_tools)
-    scoped = [t for t in base_tools if t["name"] in allowed]
-    denied = [t["name"] for t in base_tools if t["name"] not in allowed]
-    return scoped, denied
+    return scope_tools_by_names(base_tools, skill.allowed_tools)
