@@ -25,14 +25,17 @@ DEFAULT_TOP_K = 5
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
-    if not isinstance(b, list) or len(b) != len(a) or not all(isinstance(x, (int, float)) for x in b):
-        # A JSON-valid but wrong-shaped/typed stored embedding (an object, a
-        # scalar, a short/long vector from a historical write) must be
+    if (not isinstance(b, list) or len(b) != len(a)
+            or not all(isinstance(x, (int, float)) and math.isfinite(x) for x in b)):
+        # A JSON-valid but wrong-shaped/typed/non-finite stored embedding (an
+        # object, a scalar, a short/long vector, or NaN/Infinity - Python's
+        # json module accepts those non-standard literals by default) must be
         # rejected here, not silently zip()-truncated into a wrong-but-
-        # plausible score or left to crash a few lines down - caller treats
-        # ValueError the same as a JSON parse failure (CORRUPTED_EMBEDDING_SKIPPED).
+        # plausible score, or left to corrupt the sort with a NaN a few lines
+        # down - caller treats ValueError the same as a JSON parse failure
+        # (CORRUPTED_EMBEDDING_SKIPPED).
         raise ValueError(f"stored embedding has shape/type {type(b).__name__}, "
-                          f"expected a {len(a)}-element numeric list")
+                          f"expected a {len(a)}-element finite numeric list")
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))

@@ -119,3 +119,18 @@ def test_search_skips_shape_mismatched_embedding_without_wrong_score():
 
     assert len(results) == 1
     assert results[0]["text"] == "about apples"
+
+
+def test_search_skips_non_finite_embedding_values():
+    """Python's json module accepts NaN/Infinity as non-standard literals;
+    a stored embedding containing one must be skipped like a parse failure,
+    never scored - a NaN cosine score would corrupt the ranking sort."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "nan vector", "[NaN, 0.0, 0.0]")
+    _insert_chunk(session_id, "doc-1", 2, "about apples", json.dumps(_VECTORS["about apples"]))
+
+    results = retrieval.search(session_id, "query")
+
+    assert len(results) == 1
+    assert results[0]["text"] == "about apples"

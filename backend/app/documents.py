@@ -174,6 +174,15 @@ def ingest(session_id: str, filename: str, file_bytes: bytes,
                     f"exceeds the per-document chunk limit")
 
     embeddings_list = embeddings.embed_texts([content for _, _, content in chunk_rows])
+    if len(embeddings_list) != len(chunk_rows):
+        # A contract violation (embed_texts() must return exactly one vector
+        # per input text), not a chunk-level failure - zip() below would
+        # otherwise silently truncate to the shorter list, committing a
+        # document marked "ready" with fewer chunk rows than its own
+        # chunk_count/page_count trace fields claim.
+        raise embeddings.EmbeddingUnavailableError(
+            f"embedding backend returned {len(embeddings_list)} vectors "
+            f"for {len(chunk_rows)} chunks")
 
     document_id = uuid.uuid4().hex
     status = "ready" if chunk_rows else "empty"

@@ -171,6 +171,24 @@ def test_ingest_single_page_text_bomb_raises_before_chunking(monkeypatch):
     assert documents.list_chunks(session_id) == []
 
 
+def test_ingest_embedder_vector_count_mismatch_raises_no_partial_rows(monkeypatch):
+    """embed_texts() must return exactly one vector per input chunk; a
+    backend that returns fewer must not silently commit a document marked
+    "ready" with a chunk_count that doesn't match what was actually
+    inserted (zip()'s silent-truncation failure mode)."""
+    session_id = context.create_session()
+
+    def _short_embed_texts(texts):
+        return [[0.0, 0.0, 0.0] for _ in texts[:-1]] if texts else []
+    monkeypatch.setattr(embeddings, "embed_texts", _short_embed_texts)
+
+    with pytest.raises(embeddings.EmbeddingUnavailableError):
+        documents.ingest(session_id, "sample.pdf", _make_pdf("hello"))
+
+    assert documents.list_documents(session_id) == []
+    assert documents.list_chunks(session_id) == []
+
+
 def test_ingest_page_extraction_failure_raises_corrupted_no_partial_rows(monkeypatch):
     session_id = context.create_session()
     pdf_bytes = _make_pdf("hello", pages=1)
