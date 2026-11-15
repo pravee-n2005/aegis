@@ -1,10 +1,33 @@
 import io
 import json
+import time
 
 import pytest
 
 from app import context, db, documents, embeddings
 from app.config import settings
+
+
+# Module-level (picklable) fake extraction workers, injected via
+# documents._extract_pdf_isolated's/documents.ingest()'s worker lookup to
+# test the isolation boundary deterministically - the "spawn" context pickles
+# a worker by module+name reference, so it cannot be a local closure/lambda.
+
+def _worker_reports_corrupted(file_bytes, result_queue, max_pages, memory_bytes, cpu_seconds):
+    result_queue.put(("corrupted", "simulated pypdf internal failure, not a PdfReadError subclass"))
+
+
+def _worker_hangs_forever(file_bytes, result_queue, max_pages, memory_bytes, cpu_seconds):
+    time.sleep(3600)
+
+
+def _worker_exits_abnormally(file_bytes, result_queue, max_pages, memory_bytes, cpu_seconds):
+    import os
+    os._exit(1)
+
+
+def _worker_reports_ok(file_bytes, result_queue, max_pages, memory_bytes, cpu_seconds):
+    result_queue.put(("ok", 1, ["real extracted text"]))
 
 
 @pytest.fixture(autouse=True)
@@ -171,6 +194,48 @@ def test_ingest_single_page_text_bomb_raises_before_chunking(monkeypatch):
     assert documents.list_chunks(session_id) == []
 
 
+def test_ingest_extraction_timeout_kills_worker_raises_no_partial_rows(monkeypatch):
+    """A hung extraction worker (e.g. a decompression bomb spinning the CPU,
+    or stuck in a C-level loop no Python-level cap can interrupt) must be
+    killed by the parent's wall-clock timeout, not left running - this is
+    the actual resource boundary, not the post-extraction character cap."""
+    session_id = context.create_session()
+    monkeypatch.setattr(documents, "PDF_EXTRACTION_TIMEOUT_SECONDS", 1)
+    monkeypatch.setattr(documents, "_extraction_worker", _worker_hangs_forever)
+
+    with pytest.raises(documents.PDFExtractionError, match="time limit"):
+        documents.ingest(session_id, "hangs.pdf", _make_pdf("hello"))
+
+    assert documents.list_documents(session_id) == []
+    assert documents.list_chunks(session_id) == []
+
+
+def test_ingest_extraction_abnormal_exit_raises_no_partial_rows(monkeypatch):
+    """A worker process that dies outright (OOM-killed by the OS for
+    exceeding its memory limit, a hard crash, a signal) must be detected via
+    its exit code and reported as PDFExtractionError, not silently treated
+    as success or hang the parent waiting on an empty queue."""
+    session_id = context.create_session()
+    monkeypatch.setattr(documents, "_extraction_worker", _worker_exits_abnormally)
+
+    with pytest.raises(documents.PDFExtractionError, match="abnormally"):
+        documents.ingest(session_id, "crashes.pdf", _make_pdf("hello"))
+
+    assert documents.list_documents(session_id) == []
+    assert documents.list_chunks(session_id) == []
+
+
+def test_extract_pdf_isolated_happy_path_via_injected_worker():
+    """Sanity check that the isolation plumbing itself (spawn a process,
+    read its queue, return (page_count, page_texts)) works end to end for
+    a worker that reports success, independent of real PDF parsing."""
+    page_count, page_texts = documents._extract_pdf_isolated(
+        b"irrelevant for this fake worker", worker=_worker_reports_ok)
+
+    assert page_count == 1
+    assert page_texts == ["real extracted text"]
+
+
 def test_ingest_embedder_vector_count_mismatch_raises_no_partial_rows(monkeypatch):
     """embed_texts() must return exactly one vector per input chunk; a
     backend that returns fewer must not silently commit a document marked
@@ -190,12 +255,16 @@ def test_ingest_embedder_vector_count_mismatch_raises_no_partial_rows(monkeypatc
 
 
 def test_ingest_page_extraction_failure_raises_corrupted_no_partial_rows(monkeypatch):
+    """A page-extraction exception that isn't a PdfReadError subclass (e.g.
+    pypdf's ParseError/DependencyError, or any other internal failure) must
+    still surface as CorruptedPDFError, not escape as a raw 500. Uses the
+    injectable worker (module-level, picklable - required for the "spawn"
+    isolation context) to simulate this deterministically, rather than
+    monkeypatching pypdf internals, which the isolated child process
+    (started fresh via spawn) would never see."""
     session_id = context.create_session()
     pdf_bytes = _make_pdf("hello", pages=1)
-
-    def _raise_extract_text(self):
-        raise RuntimeError("simulated pypdf internal failure, not a PdfReadError subclass")
-    monkeypatch.setattr("pypdf._page.PageObject.extract_text", _raise_extract_text)
+    monkeypatch.setattr(documents, "_extraction_worker", _worker_reports_corrupted)
 
     with pytest.raises(documents.CorruptedPDFError):
         documents.ingest(session_id, "sample.pdf", pdf_bytes)

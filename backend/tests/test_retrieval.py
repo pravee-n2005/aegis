@@ -53,12 +53,17 @@ def _insert_chunk(session_id, document_id, page_number, content, embedding_json)
 
 
 def test_search_ranks_by_cosine_similarity_highest_first():
+    """Ranking-order mechanics, independent of relevance filtering (which
+    has its own dedicated tests below) - explicit min_score=0.0 keeps this
+    test's original toy vectors (including "about bananas", which scores
+    below the production default threshold against this query) meaningful
+    for what it actually checks: sort order."""
     session_id = context.create_session()
     _insert_document(session_id, "doc-1", filename="fruit.pdf")
     _insert_chunk(session_id, "doc-1", 1, "about bananas", json.dumps(_VECTORS["about bananas"]))
     _insert_chunk(session_id, "doc-1", 2, "about apples", json.dumps(_VECTORS["about apples"]))
 
-    results = retrieval.search(session_id, "query", top_k=5)
+    results = retrieval.search(session_id, "query", top_k=5, min_score=0.0)
 
     assert [r["text"] for r in results] == ["about apples", "about bananas"]
     assert results[0]["filename"] == "fruit.pdf"
@@ -67,12 +72,15 @@ def test_search_ranks_by_cosine_similarity_highest_first():
 
 
 def test_search_respects_top_k():
+    """top_k truncation mechanics, independent of relevance filtering -
+    explicit min_score=0.0 since these synthetic chunks all score 0.0
+    against the query vector (toy vectors, not real embeddings)."""
     session_id = context.create_session()
     _insert_document(session_id, "doc-1")
     for i in range(10):
         _insert_chunk(session_id, "doc-1", i + 1, f"chunk {i}", json.dumps([0.0, 0.0, 1.0]))
 
-    results = retrieval.search(session_id, "query", top_k=3)
+    results = retrieval.search(session_id, "query", top_k=3, min_score=0.0)
 
     assert len(results) == 3
 
@@ -134,3 +142,86 @@ def test_search_skips_non_finite_embedding_values():
 
     assert len(results) == 1
     assert results[0]["text"] == "about apples"
+
+
+# --- Relevance threshold (M4 security hardening, 2026-11-15) ---
+# Default threshold (settings.search_relevance_threshold = 0.2) is a
+# measured value, not a guess - see config.py's docstring for the real
+# sentence-transformers scores it was derived from. These tests use the toy
+# vectors already established in this file ("query" = [1,0,0]): "about
+# apples" ([0.9,0.1,0], cosine ~0.994) stands in for a clearly relevant
+# match, [0,1,0]/[0,0,1] (cosine 0.0) for a clearly unrelated one, and two
+# vectors picked to land just above/below 0.2 for the borderline case.
+
+def test_search_relevant_chunk_returned_with_citation_metadata_intact():
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1", filename="relevant.pdf")
+    _insert_chunk(session_id, "doc-1", 7, "about apples", json.dumps(_VECTORS["about apples"]))
+
+    results = retrieval.search(session_id, "query")
+
+    assert len(results) == 1
+    assert results[0]["filename"] == "relevant.pdf"
+    assert results[0]["page"] == 7
+    assert results[0]["text"] == "about apples"
+    assert results[0]["score"] >= settings.search_relevance_threshold
+
+
+def test_search_unrelated_chunk_filtered_out_even_as_only_candidate():
+    """An irrelevant chunk is never returned as supporting evidence, even
+    when it's the session's only chunk and would otherwise fill the top-K."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "unrelated", json.dumps([0.0, 1.0, 0.0]))
+
+    assert retrieval.search(session_id, "query") == []
+
+
+def test_search_returns_empty_when_nothing_meets_threshold():
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "unrelated one", json.dumps([0.0, 1.0, 0.0]))
+    _insert_chunk(session_id, "doc-1", 2, "unrelated two", json.dumps([0.0, 0.0, 1.0]))
+
+    assert retrieval.search(session_id, "query") == []
+
+
+def test_search_borderline_chunk_included_when_score_above_threshold():
+    """A borderline-relevance chunk scoring just above the threshold is
+    still returned - the threshold is a floor, not a strict high bar."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "borderline above", json.dumps([0.25, 0.97, 0.0]))
+
+    results = retrieval.search(session_id, "query")
+
+    assert len(results) == 1
+    assert results[0]["text"] == "borderline above"
+    assert results[0]["score"] >= settings.search_relevance_threshold
+
+
+def test_search_borderline_chunk_excluded_when_score_below_threshold():
+    """Same vector family as the "above" case, scaled down just enough to
+    land under the threshold - confirms the cutoff actually excludes, not
+    just that it exists."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "borderline below", json.dumps([0.1, 0.99, 0.0]))
+
+    assert retrieval.search(session_id, "query") == []
+
+
+def test_search_threshold_is_configurable_via_settings(monkeypatch):
+    """The threshold is read from settings at call time, not hardcoded -
+    lowering it admits a chunk the default would exclude."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "borderline below", json.dumps([0.1, 0.99, 0.0]))
+
+    assert retrieval.search(session_id, "query") == []
+
+    monkeypatch.setattr(settings, "search_relevance_threshold", 0.05)
+    results = retrieval.search(session_id, "query")
+
+    assert len(results) == 1
+    assert results[0]["text"] == "borderline below"

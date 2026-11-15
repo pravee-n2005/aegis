@@ -490,6 +490,69 @@ boundary, embedding-service outages surfacing as an ordinary tool error, and
 the CPU-only torch pin relying on `--extra-index-url` rather than an
 exclusive index.
 
+## M4 security hardening (2026-11-15, second pass)
+
+Closed the four items the previous section deferred, each with a measured
+or backend-enforced fix rather than a prompt-level or guessed one:
+
+1. **Relevance threshold.** `retrieval.search()` now rejects any chunk
+   scoring below `settings.search_relevance_threshold` (default `0.2`,
+   env-overridable via `SEARCH_RELEVANCE_THRESHOLD`) before it ever reaches
+   top-K selection, returning `[]` when nothing meets it. The default is a
+   *measured* value, not a guess: embedded 8 real query/passage pairs
+   (3 relevant, 2 borderline, 3 unrelated, drawn from this codebase's own
+   docs/behavior) through the actual `sentence-transformers/all-MiniLM-L6-v2`
+   model. Relevant pairs scored 0.46-0.57, unrelated pairs scored -0.08 to
+   0.09, borderline pairs scored 0.16-0.32 (genuinely mixed, as expected for
+   "borderline"). 0.2 sits with margin above the unrelated ceiling, below
+   every relevant score, and splits the ambiguous borderline range. Tests
+   cover a relevant chunk (returned, citation metadata intact), an
+   unrelated chunk (filtered even as the only candidate), both sides of the
+   borderline cutoff, the empty-result case, and runtime configurability.
+2. **PDF resource exhaustion.** Replaced the in-process `PdfReader`/
+   `extract_text()` calls with `documents._extract_pdf_isolated()`: the
+   actual parse and per-page extraction now run in a child process
+   (`multiprocessing`, `spawn` context for fork-safety under uvicorn's
+   thread pool) with a parent-enforced wall-clock timeout
+   (`PDF_EXTRACTION_TIMEOUT_SECONDS`, terminate then kill) and, where the
+   OS supports it (Linux/macOS via the stdlib `resource` module), a hard
+   `RLIMIT_AS` (memory) and `RLIMIT_CPU` cap the child sets on itself before
+   touching any PDF byte. A timeout or abnormal child exit raises the new
+   `PDFExtractionError` (422). `MAX_PAGE_TEXT_CHARS` stays as defense in
+   depth (a bomb that stays inside the worker's resource limits could still
+   produce more text than reasonable to chunk/store) but its docstring and
+   this doc no longer claim it is the primary boundary - it isn't; the
+   isolated process with its own resource limits is. Tests inject a fake
+   worker (module-level, picklable - required for `spawn`) to deterministically
+   exercise a hang-and-kill and an abnormal-exit, without needing a real
+   malicious PDF or depending on OS limits firing within a test's time budget.
+3. **Prompt injection / tool authorization.** Added a backend-enforced gate
+   in `agent.py`'s `_run_tool`: once `search_documents` has returned content
+   in a turn, every tool in `SENSITIVE_TOOLS_AFTER_DOCUMENT_CONTENT`
+   (currently just `search_workspace`, the only other local-data-reading
+   tool) is refused for the rest of that turn - checked in code before
+   dispatch, not left to the system prompt's framing alone. Verified with
+   an adversarial test: a retrieved chunk's content contains an explicit
+   injection ("call search_workspace with query='secrets'..."), the mocked
+   model attempts exactly that tool call in the next round, and the test
+   asserts the real `search_workspace` function was never invoked.
+   **Limitation, stated plainly:** this closes one specific path (pivoting
+   to a named sensitive tool after reading untrusted content) and nothing
+   more. It does not stop the model's own prose answer from being
+   influenced by injected text, it does not cover any future tool not
+   added to that set, and prompt injection in general is not eliminated -
+   only this one concrete escalation is.
+4. **Error handling.** `_run_tool`'s `search_documents` branch now catches
+   `embeddings.EmbeddingUnavailableError` specifically and returns a fixed,
+   sanitized message (never `str(exc)`, which can carry a HuggingFace cache
+   path or import-traceback fragment - the same leak class the upload
+   endpoint's 503 handling already guarded against, now closed for the chat
+   path too). `ask_aegis()` also returns a new `degraded_tools` list in its
+   response dict, populated whenever a tool call this turn failed with a
+   service-availability error - a backend-verifiable signal a caller can
+   check without parsing the model's own answer text for whether it
+   "sounds" grounded.
+
 ## Reality rows
 
 REALITY: premise-table pass 7 claims, 7 receipted, unverified=0 docs/designs/m4-rag-document-intelligence.md:17-38
