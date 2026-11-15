@@ -434,6 +434,62 @@ from a mocked response.
 2. **Upload size limit** — no specific number was given; propose a default
    (e.g. 20MB / ~500 pages) unless you want a different limit.
 
+## Post-ship correction (2026-11-15)
+
+Two independent `/codex` second-opinion review passes against `main` surfaced
+and fixed real gaps the original CEO/Eng/DX review rounds and `/review`'s own
+6-specialist + adversarial pass all missed:
+
+1. **`retrieval.py` imported `embed_texts` by name** (`from .embeddings import
+   embed_texts`) instead of calling `embeddings.embed_texts(...)` like
+   `documents.py` correctly did. Every test that monkeypatched
+   `embeddings.embed_texts` therefore patched the wrong binding — every
+   "mocked" retrieval test was silently loading and running the real
+   sentence-transformers model. Fixed to the qualified call; confirmed by the
+   test suite dropping from ~11-13s to ~3.5s.
+2. **PDF-bomb cap gap**: the chunk-count cap only trips after a page's text
+   is already fully extracted and chunked. Added a per-page extracted-text
+   character cap (`MAX_PAGE_TEXT_CHARS`), checked immediately after
+   `extract_text()`, before chunking.
+3. **Silent-wrong-score and crash gaps in `_cosine()`**: a JSON-valid but
+   wrong-shaped/typed or non-finite (`NaN`/`Infinity`, which Python's `json`
+   module accepts by default) stored embedding either produced a
+   `zip()`-truncated wrong-but-plausible score or crashed outside the
+   per-row error handling. Both are now rejected the same way as a JSON
+   parse failure (`CORRUPTED_EMBEDDING_SKIPPED`).
+4. **`embed_texts()` vector-count contract never validated**: a backend
+   returning fewer vectors than input chunks was silently truncated by
+   `zip(chunk_rows, embeddings_list)`, committing a document marked `ready`
+   with a `chunk_count` that didn't match its actual inserted rows. Now
+   validated explicitly, raising `EmbeddingUnavailableError` on mismatch.
+5. **`search_documents` tool-scoping security correction** (the most
+   significant finding): the original Hour 4-5 decision above made
+   `search_documents` "unconditionally available ... not skill-scoped,"
+   deliberately mirroring `load_skill`'s exemption. Codex correctly
+   identified this as a least-privilege violation — a skill explicitly
+   declaring `allowed-tools: []` (or any allowlist omitting
+   `search_documents`) should mean "no document access either," not an
+   implicit carve-out. **Corrected**: `search_documents` is now a normal
+   member of `agent.py`'s `TOOLS` list, scoped by M2's existing
+   `scope_tools`/`scope_tools_by_names` mechanism exactly like `calculator`
+   and `search_workspace`. Only `load_skill` keeps its unconditional
+   exemption (a skill must always be able to load a different skill and
+   replace its own scope, even under a deny-all — this is M2's own
+   pre-existing, separately-reviewed "Outside Voice finding 1" fix, unrelated
+   to this correction). Verified: all five permission cases (no skill
+   loaded, allowed-tools omitted, `allowed-tools: []`, explicit allowlist
+   including it, explicit allowlist excluding it) plus persistence of the
+   scope across separate `/api/chat` requests and replacement by a later
+   skill load, each have a dedicated regression test in `test_agent.py`.
+
+Not fixed in this correction (recorded in `TODOS.md` instead, as genuine
+architectural tradeoffs or pre-existing, project-wide conventions rather than
+regressions this diff introduced): no relevance-score threshold on retrieved
+chunks, retrieved document text as a soft (prompt-level, not enforced) trust
+boundary, embedding-service outages surfacing as an ordinary tool error, and
+the CPU-only torch pin relying on `--extra-index-url` rather than an
+exclusive index.
+
 ## Reality rows
 
 REALITY: premise-table pass 7 claims, 7 receipted, unverified=0 docs/designs/m4-rag-document-intelligence.md:17-38
@@ -518,11 +574,14 @@ HOUR 2-3 (core logic):  Page-bounded chunking with overlap; mapping pypdf's
                          estimate heuristic (resolved below — chars, not the
                          heuristic, for chunk boundaries).
 HOUR 4-5 (integration): Wiring search_documents into agent.py's TOOLS/
-                         _run_tool and SYSTEM_PROMPT without disturbing M2's
-                         skill-tool-scoping logic (search_documents must be
-                         unconditionally available like calculator/
-                         search_workspace, not skill-scoped). Verifying tool
-                         results round-trip through context.append_message
+                         _run_tool and SYSTEM_PROMPT, scoped by M2's existing
+                         skill-tool-scoping logic exactly like calculator and
+                         search_workspace (corrected 2026-11-15 - see
+                         "Post-ship correction" below; the implementation
+                         briefly made it unconditionally available, which a
+                         Codex second-opinion review correctly flagged as a
+                         least-privilege gap). Verifying tool results
+                         round-trip through context.append_message
                          unchanged (no new serialization path).
 HOUR 6+ (polish/tests): Upload-size/page-count caps to prevent a PDF
                          decompression bomb from consuming CPU/memory before

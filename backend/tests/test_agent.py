@@ -124,15 +124,16 @@ def test_max_tool_round_exhaustion(mock_anthropic):
 @patch("app.agent.Anthropic")
 def test_m1_regression_no_skills_directory(mock_anthropic):
     """With no skills directory, tools= and system= passed to the API must be
-    byte-for-byte what M1 always sent, plus the always-on M4 search_documents
-    tool — proves the skills feature itself is fully inert when absent."""
+    byte-for-byte what M1 always sent (TOOLS now includes search_documents
+    as a normal scoped tool, M4 security correction 2026-11-15) — proves the
+    skills feature itself is fully inert when absent."""
     mock_client = _mock_client([_response([_text_block("Hello there.")], "end_turn")])
     mock_anthropic.return_value = mock_client
-    from app.agent import SEARCH_DOCUMENTS_TOOL, SYSTEM_PROMPT
+    from app.agent import SYSTEM_PROMPT
     result = ask_aegis(_session(), "Hi")
     assert result["answer"] == "Hello there."
     call = mock_client.messages.create.call_args
-    assert call.kwargs["tools"] == TOOLS + [SEARCH_DOCUMENTS_TOOL]
+    assert call.kwargs["tools"] == TOOLS
     assert call.kwargs["system"] == SYSTEM_PROMPT
 
 
@@ -172,7 +173,9 @@ def test_load_skill_scopes_tools_for_next_round(mock_anthropic, isolate_skills_d
     first_call, second_call = mock_client.messages.create.call_args_list
     assert sorted(_tool_names(first_call)) == [
         "calculator", "load_skill", "search_documents", "search_workspace"]
-    assert sorted(_tool_names(second_call)) == ["calculator", "search_documents"]
+    # search_documents is a normal scoped tool now: an explicit allowlist
+    # that omits it excludes it, same as search_workspace.
+    assert sorted(_tool_names(second_call)) == ["calculator"]
     assert result["trace"][0]["tool"] == "load_skill"
     assert result["trace"][0]["result"] == {"instructions": "Follow these instructions."}
 
@@ -188,9 +191,13 @@ def test_load_skill_empty_allowlist_denies_all_tools(mock_anthropic, isolate_ski
     mock_anthropic.return_value = mock_client
     ask_aegis(_session(), "Use the demo skill")
     _, second_call = mock_client.messages.create.call_args_list
-    # search_documents is unconditionally available — never skill-scoped —
-    # so a deny-all skill allowlist still leaves it as the one tool offered.
-    assert _tool_names(second_call) == ["search_documents"]
+    # search_documents is a normal scoped tool now: a deny-all allowlist
+    # blocks it too, same as every other tool (load_skill isn't re-added
+    # once a skill has already loaded this request - a second load_skill
+    # call is rejected as ALREADY_LOADED anyway, so there's nothing to switch to).
+    assert _tool_names(second_call) == []
+    # omitted entirely, not an explicit [] — some SDKs/APIs treat them differently
+    assert "tools" not in second_call.kwargs
 
 
 @patch("app.agent.Anthropic")
@@ -323,11 +330,25 @@ def test_search_documents_skips_corrupted_row_without_crashing(mock_anthropic):
     assert returned[0]["text"] == "good row"
 
 
+# --- M4 security correction (2026-11-15): search_documents is a normal
+# scoped tool, not unconditionally available. Five permission cases below,
+# plus persistence of the scope across separate chat requests. ---
+
 @patch("app.agent.Anthropic")
-def test_search_documents_unconditionally_available_even_with_skill_scoping(
-        mock_anthropic, isolate_skills_dir):
-    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Only does arithmetic.",
-                 allowed_tools=["calculator"])
+def test_search_documents_available_when_no_skill_loaded(mock_anthropic, isolate_skills_dir):
+    """Case 1: no loaded skill -> search_documents available."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "A demo skill.")
+    mock_client = _mock_client([_response([_text_block("Hi.")], "end_turn")])
+    mock_anthropic.return_value = mock_client
+    ask_aegis(_session(), "Hello")
+    call = mock_client.messages.create.call_args
+    assert "search_documents" in _tool_names(call)
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_available_when_allowed_tools_omitted(mock_anthropic, isolate_skills_dir):
+    """Case 2: skill with allowed-tools omitted (unrestricted) -> available."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Unrestricted skill.")
     mock_client = _mock_client([
         _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
         _response([_text_block("Done.")], "end_turn"),
@@ -336,3 +357,108 @@ def test_search_documents_unconditionally_available_even_with_skill_scoping(
     ask_aegis(_session(), "Use the demo skill")
     _, second_call = mock_client.messages.create.call_args_list
     assert "search_documents" in _tool_names(second_call)
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_blocked_by_empty_allowlist(mock_anthropic, isolate_skills_dir):
+    """Case 3: allowed-tools: [] -> search_documents blocked, same as every
+    other non-load_skill tool."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Deny-all skill.", allowed_tools=[])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+    ask_aegis(_session(), "Use the demo skill")
+    _, second_call = mock_client.messages.create.call_args_list
+    assert "search_documents" not in _tool_names(second_call)
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_allowed_when_explicitly_listed(mock_anthropic, isolate_skills_dir):
+    """Case 4: explicit allowlist containing search_documents -> available."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "RAG-only skill.",
+                 allowed_tools=["search_documents"])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+    ask_aegis(_session(), "Use the demo skill")
+    _, second_call = mock_client.messages.create.call_args_list
+    assert sorted(_tool_names(second_call)) == ["search_documents"]
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_blocked_by_allowlist_excluding_it(mock_anthropic, isolate_skills_dir):
+    """Case 5: explicit allowlist excluding search_documents -> blocked."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Arithmetic-only skill.",
+                 allowed_tools=["calculator"])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+    ask_aegis(_session(), "Use the demo skill")
+    _, second_call = mock_client.messages.create.call_args_list
+    assert sorted(_tool_names(second_call)) == ["calculator"]
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_scope_persists_across_separate_chat_requests(
+        mock_anthropic, isolate_skills_dir):
+    """A skill's allowed-tools scope, once loaded, persists to the session
+    (context.set_skill_state) and is re-applied on a LATER, separate
+    ask_aegis() call - not just within the same multi-round tool-use loop.
+    load_skill is re-offered on this later call (the model can always load
+    a different skill and replace the scope), but search_documents stays
+    blocked until it does."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Arithmetic-only skill.",
+                 allowed_tools=["calculator"])
+    session_id = _session()
+
+    mock_client_1 = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client_1
+    ask_aegis(session_id, "Use the demo skill")
+
+    mock_client_2 = _mock_client([_response([_text_block("Still scoped.")], "end_turn")])
+    mock_anthropic.return_value = mock_client_2
+    ask_aegis(session_id, "Another message, same session")
+
+    call = mock_client_2.messages.create.call_args
+    assert sorted(_tool_names(call)) == ["calculator", "load_skill"]
+    assert "search_documents" not in _tool_names(call)
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_later_skill_load_replaces_persisted_scope(
+        mock_anthropic, isolate_skills_dir):
+    """Case 6 (requirement): a later skill load replaces the previous
+    skill's persisted tool scope, rather than merging with or being blocked
+    by it - loading a RAG-only skill after an arithmetic-only one restores
+    search_documents access."""
+    _write_skill(isolate_skills_dir, "narrow", "narrow-skill", "Arithmetic-only skill.",
+                 allowed_tools=["calculator"])
+    _write_skill(isolate_skills_dir, "rag", "rag-skill", "RAG-only skill.",
+                 allowed_tools=["search_documents"])
+    session_id = _session()
+
+    mock_client_1 = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "narrow-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client_1
+    ask_aegis(session_id, "Use the narrow skill")
+
+    mock_client_2 = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "rag-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client_2
+    ask_aegis(session_id, "Now use the rag skill instead")
+
+    _, second_call = mock_client_2.messages.create.call_args_list
+    assert sorted(_tool_names(second_call)) == ["search_documents"]
