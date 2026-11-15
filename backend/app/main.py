@@ -1,20 +1,26 @@
+import asyncio
 from contextlib import asynccontextmanager
 from sqlite3 import OperationalError
 from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, UploadFile
 from pydantic import BaseModel, Field
 from anthropic import APIError
 
 from . import context
+from . import documents
 from . import memory
 from .agent import ask_aegis, TOOLS
 from .config import settings
 from .context import SessionNotFoundError
+from .documents import DocumentNotFoundError, InvalidPDFError, UploadTooLargeError
+from .embeddings import EmbeddingUnavailableError
 from .memory import MemoryNotFoundError
 from .skills import discover_skills, EVENT_DISCOVERED
 from .tracing import new_request_id, redact, write_trace
 from . import db
+
+UPLOAD_READ_CHUNK_BYTES = 1024 * 1024
 
 @asynccontextmanager
 async def _lifespan(app: FastAPI):
@@ -140,6 +146,71 @@ def delete_session(session_id: str):
         context.delete_session(session_id)
     except SessionNotFoundError as exc:
         raise HTTPException(status_code=404, detail="unknown session_id") from exc
+    except (OperationalError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable") from exc
+    return {"status": "deleted"}
+
+
+async def _read_upload_bounded(file: UploadFile, max_bytes: int) -> bytes:
+    """Stream-read an upload in fixed-size chunks and abort as soon as the
+    total exceeds max_bytes, instead of reading the whole body into memory
+    first and checking its length after - the latter is itself the DoS
+    vector an oversized upload is supposed to be rejected before causing."""
+    chunks = []
+    total = 0
+    while True:
+        chunk = await file.read(UPLOAD_READ_CHUNK_BYTES)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+        if total > max_bytes:
+            raise UploadTooLargeError(
+                f"upload is over {max_bytes} bytes, exceeds the {max_bytes}-byte limit")
+    return b"".join(chunks)
+
+
+@app.post("/api/sessions/{session_id}/documents")
+async def upload_document(session_id: str, file: UploadFile):
+    request_id = new_request_id()
+    try:
+        file_bytes = await _read_upload_bounded(file, documents.MAX_UPLOAD_BYTES)
+        result = await asyncio.to_thread(
+            documents.ingest, session_id, file.filename, file_bytes, request_id=request_id)
+    except UploadTooLargeError as exc:
+        raise HTTPException(status_code=413, detail=str(exc)) from exc
+    except InvalidPDFError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+    except EmbeddingUnavailableError as exc:
+        # A fixed, greppable detail string here, not str(exc) - the
+        # underlying message can carry internal detail (a HuggingFace cache
+        # path, an import traceback fragment) that shouldn't reach a client.
+        raise HTTPException(status_code=503,
+                             detail="embedding service unavailable, try again shortly") from exc
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="unknown session_id") from exc
+    except (OperationalError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable") from exc
+    return result
+
+
+@app.get("/api/sessions/{session_id}/documents")
+def list_session_documents(session_id: str):
+    try:
+        docs = documents.list_documents(session_id)
+    except SessionNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="unknown session_id") from exc
+    except (OperationalError, OSError) as exc:
+        raise HTTPException(status_code=503, detail="Storage temporarily unavailable") from exc
+    return {"documents": docs}
+
+
+@app.delete("/api/sessions/{session_id}/documents/{document_id}")
+def delete_session_document(session_id: str, document_id: str):
+    try:
+        documents.delete_document(document_id, session_id)
+    except DocumentNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="document not found") from exc
     except (OperationalError, OSError) as exc:
         raise HTTPException(status_code=503, detail="Storage temporarily unavailable") from exc
     return {"status": "deleted"}

@@ -7,10 +7,12 @@ connection, not per database file, so a raw sqlite3.connect() call anywhere
 else would silently stop cascading deletes while the parent row still
 disappears.
 
-Schema: sessions / messages / summaries / memories, each scoped by
-session_id with an index covering that filter, plus a single-row
-schema_version table so a future migration has a version to check against
-(not used by M3 itself - first schema version, nothing to migrate from).
+Schema: sessions / messages / summaries / memories / documents / chunks,
+each scoped by session_id with an index covering that filter, plus a
+single-row schema_version table so a future migration has a version to
+check against (not used by M3/M4 - first schema version, nothing to
+migrate from). documents/chunks (M4) are additive tables only; no M1-M3
+table changed.
 """
 import sqlite3
 from pathlib import Path
@@ -78,9 +80,32 @@ def init_db() -> None:
                 created_at TEXT NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                filename TEXT NOT NULL,
+                page_count INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'ready',
+                created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS chunks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                document_id TEXT NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
+                session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                embedding TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, id);
             CREATE INDEX IF NOT EXISTS idx_summaries_session ON summaries(session_id, id);
             CREATE INDEX IF NOT EXISTS idx_memories_session ON memories(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_documents_session ON documents(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_session ON chunks(session_id, id);
+            CREATE INDEX IF NOT EXISTS idx_chunks_document ON chunks(document_id, chunk_index);
             """
         )
         row = conn.execute("SELECT COUNT(*) FROM schema_version").fetchone()
