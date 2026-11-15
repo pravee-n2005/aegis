@@ -156,6 +156,21 @@ def test_ingest_chunk_limit_exceeded_raises_no_partial_rows(monkeypatch):
     assert documents.list_chunks(session_id) == []
 
 
+def test_ingest_single_page_text_bomb_raises_before_chunking(monkeypatch):
+    """A single pathological page's extracted text, not spread across many
+    chunks, must be rejected on its own - MAX_CHUNKS_PER_DOCUMENT alone
+    can't catch this since it only trips after chunking already happened."""
+    session_id = context.create_session()
+    monkeypatch.setattr(documents, "MAX_PAGE_TEXT_CHARS", 10)
+    pdf_bytes = _make_pdf("more than ten characters of text", pages=1)
+
+    with pytest.raises(documents.ChunkLimitExceededError):
+        documents.ingest(session_id, "bomb.pdf", pdf_bytes)
+
+    assert documents.list_documents(session_id) == []
+    assert documents.list_chunks(session_id) == []
+
+
 def test_ingest_page_extraction_failure_raises_corrupted_no_partial_rows(monkeypatch):
     session_id = context.create_session()
     pdf_bytes = _make_pdf("hello", pages=1)

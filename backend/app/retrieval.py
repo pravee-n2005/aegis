@@ -15,8 +15,8 @@ import json
 import math
 
 from . import documents
+from . import embeddings
 from .tracing import new_request_id, redact, write_trace
-from .embeddings import embed_texts
 
 EVENT_RETRIEVAL = "retrieval"
 EVENT_RETRIEVAL_SKIPPED = "retrieval_row_skipped"
@@ -25,6 +25,14 @@ DEFAULT_TOP_K = 5
 
 
 def _cosine(a: list[float], b: list[float]) -> float:
+    if not isinstance(b, list) or len(b) != len(a) or not all(isinstance(x, (int, float)) for x in b):
+        # A JSON-valid but wrong-shaped/typed stored embedding (an object, a
+        # scalar, a short/long vector from a historical write) must be
+        # rejected here, not silently zip()-truncated into a wrong-but-
+        # plausible score or left to crash a few lines down - caller treats
+        # ValueError the same as a JSON parse failure (CORRUPTED_EMBEDDING_SKIPPED).
+        raise ValueError(f"stored embedding has shape/type {type(b).__name__}, "
+                          f"expected a {len(a)}-element numeric list")
     dot = sum(x * y for x, y in zip(a, b))
     norm_a = math.sqrt(sum(x * x for x in a))
     norm_b = math.sqrt(sum(y * y for y in b))
@@ -46,17 +54,18 @@ def search(session_id: str, query: str, top_k: int = DEFAULT_TOP_K,
     if not rows:
         return []
 
-    [query_vector] = embed_texts([query])
+    [query_vector] = embeddings.embed_texts([query])
 
     scored = []
     for row in rows:
         try:
             embedding = json.loads(row["embedding"])
+            score = _cosine(query_vector, embedding)
         except (json.JSONDecodeError, TypeError, ValueError) as exc:
             write_trace(EVENT_RETRIEVAL_SKIPPED, rid, reason="CORRUPTED_EMBEDDING_SKIPPED",
                         session_id=session_id, chunk_id=row["id"], error=redact(str(exc)))
             continue
-        scored.append((_cosine(query_vector, embedding), row))
+        scored.append((score, row))
 
     scored.sort(key=lambda pair: pair[0], reverse=True)
     top = scored[:top_k]

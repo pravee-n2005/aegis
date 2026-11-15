@@ -34,6 +34,7 @@ EVENT_DELETED = "document_deleted"
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 MAX_PAGES = 500
 MAX_CHUNKS_PER_DOCUMENT = 5000
+MAX_PAGE_TEXT_CHARS = 200_000
 CHUNK_SIZE_CHARS = 800
 CHUNK_OVERLAP_CHARS = 150
 
@@ -155,6 +156,16 @@ def ingest(session_id: str, filename: str, file_bytes: bytes,
             page_text = page.extract_text() or ""
         except Exception as exc:
             raise CorruptedPDFError("PDF appears corrupted") from exc
+        if len(page_text) > MAX_PAGE_TEXT_CHARS:
+            # A single pathological page (nested/repeated content streams
+            # decompressing far beyond what the compressed PDF bytes imply)
+            # must be rejected here, before it is ever chunked - the
+            # MAX_CHUNKS_PER_DOCUMENT check below only catches a bomb spread
+            # across many chunks, not one page whose own extracted text is
+            # already enormous.
+            raise ChunkLimitExceededError(
+                f"page {page_number} produces {len(page_text)} characters of text, "
+                f"exceeds the {MAX_PAGE_TEXT_CHARS}-character per-page limit")
         for chunk_index, chunk_text in enumerate(_chunk_page_text(page_text)):
             chunk_rows.append((page_number, chunk_index, chunk_text))
             if len(chunk_rows) > MAX_CHUNKS_PER_DOCUMENT:

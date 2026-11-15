@@ -102,3 +102,20 @@ def test_search_skips_corrupted_embedding_row_without_crashing():
 
     assert len(results) == 1
     assert results[0]["text"] == "about apples"
+
+
+def test_search_skips_shape_mismatched_embedding_without_wrong_score():
+    """A JSON-valid but wrong-shaped/typed stored embedding (short vector, a
+    scalar, an object) must be skipped like a parse failure - never silently
+    scored via a zip()-truncated dot product, which would rank it on a
+    meaningless partial comparison instead of rejecting it."""
+    session_id = context.create_session()
+    _insert_document(session_id, "doc-1")
+    _insert_chunk(session_id, "doc-1", 1, "short vector", json.dumps([1.0, 0.0]))
+    _insert_chunk(session_id, "doc-1", 2, "not a list", json.dumps("5"))
+    _insert_chunk(session_id, "doc-1", 3, "about apples", json.dumps(_VECTORS["about apples"]))
+
+    results = retrieval.search(session_id, "query")
+
+    assert len(results) == 1
+    assert results[0]["text"] == "about apples"
