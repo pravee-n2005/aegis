@@ -124,15 +124,15 @@ def test_max_tool_round_exhaustion(mock_anthropic):
 @patch("app.agent.Anthropic")
 def test_m1_regression_no_skills_directory(mock_anthropic):
     """With no skills directory, tools= and system= passed to the API must be
-    byte-for-byte what M1 always sent — proves the feature is fully inert
-    when absent."""
+    byte-for-byte what M1 always sent, plus the always-on M4 search_documents
+    tool — proves the skills feature itself is fully inert when absent."""
     mock_client = _mock_client([_response([_text_block("Hello there.")], "end_turn")])
     mock_anthropic.return_value = mock_client
-    from app.agent import SYSTEM_PROMPT
+    from app.agent import SEARCH_DOCUMENTS_TOOL, SYSTEM_PROMPT
     result = ask_aegis(_session(), "Hi")
     assert result["answer"] == "Hello there."
     call = mock_client.messages.create.call_args
-    assert call.kwargs["tools"] == TOOLS
+    assert call.kwargs["tools"] == TOOLS + [SEARCH_DOCUMENTS_TOOL]
     assert call.kwargs["system"] == SYSTEM_PROMPT
 
 
@@ -170,8 +170,9 @@ def test_load_skill_scopes_tools_for_next_round(mock_anthropic, isolate_skills_d
     result = ask_aegis(_session(), "Use the demo skill")
     assert result["answer"] == "Done."
     first_call, second_call = mock_client.messages.create.call_args_list
-    assert sorted(_tool_names(first_call)) == ["calculator", "load_skill", "search_workspace"]
-    assert _tool_names(second_call) == ["calculator"]
+    assert sorted(_tool_names(first_call)) == [
+        "calculator", "load_skill", "search_documents", "search_workspace"]
+    assert sorted(_tool_names(second_call)) == ["calculator", "search_documents"]
     assert result["trace"][0]["tool"] == "load_skill"
     assert result["trace"][0]["result"] == {"instructions": "Follow these instructions."}
 
@@ -187,9 +188,9 @@ def test_load_skill_empty_allowlist_denies_all_tools(mock_anthropic, isolate_ski
     mock_anthropic.return_value = mock_client
     ask_aegis(_session(), "Use the demo skill")
     _, second_call = mock_client.messages.create.call_args_list
-    assert _tool_names(second_call) == []
-    # omitted entirely, not an explicit [] — some SDKs/APIs treat them differently
-    assert "tools" not in second_call.kwargs
+    # search_documents is unconditionally available — never skill-scoped —
+    # so a deny-all skill allowlist still leaves it as the one tool offered.
+    assert _tool_names(second_call) == ["search_documents"]
 
 
 @patch("app.agent.Anthropic")
@@ -244,3 +245,94 @@ def test_trace_includes_skill_lifecycle_events(mock_anthropic, isolate_skills_di
     scoping = [r for r in records if r["event"] == "skill_tool_scoping"][0]
     assert scoping["reason"] == "TOOL_DENIED"
     assert "search_workspace" in scoping["denied_tools"]
+
+
+@pytest.fixture(autouse=True)
+def fake_embedder_for_retrieval(monkeypatch):
+    """No agent test downloads or runs the real sentence-transformers model."""
+    from app import embeddings
+    def _fake_embed_texts(texts):
+        return [[float(len(t)), 0.0, 0.0] for t in texts]
+    monkeypatch.setattr(embeddings, "embed_texts", _fake_embed_texts)
+
+
+def _insert_chunk_row(session_id, document_id, filename, page, content, embedding_json):
+    from app import db as _db
+    conn = _db.get_connection()
+    try:
+        conn.execute(
+            "INSERT OR IGNORE INTO documents (id, session_id, filename, page_count, status, created_at) "
+            "VALUES (?, ?, ?, 1, 'ready', '2026-01-01T00:00:00+00:00')",
+            (document_id, session_id, filename),
+        )
+        conn.execute(
+            "INSERT INTO chunks (document_id, session_id, page_number, chunk_index, content, "
+            "embedding, created_at) VALUES (?, ?, ?, 0, ?, ?, '2026-01-01T00:00:00+00:00')",
+            (document_id, session_id, page, content, embedding_json),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_tool_returns_session_scoped_chunks(mock_anthropic):
+    """Acceptance test for M4 Phase 2 (docs/designs/m4-rag-document-intelligence.md,
+    Phase 2): the model's first call returns a search_documents tool_use
+    block, the dispatch returns the session's chunks (never another
+    session's — the adversarial cross-session case), and the final answer
+    plus trace are returned same as any other tool-call test."""
+    session_id = _session()
+    other_session = _session()
+    _insert_chunk_row(session_id, "doc-mine", "mine.pdf", 1, "mine content", '[3.0, 0.0, 0.0]')
+    _insert_chunk_row(other_session, "doc-other", "other.pdf", 1, "other content", '[3.0, 0.0, 0.0]')
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "content"})], "tool_use"),
+        _response([_text_block("Answer with citation (mine.pdf, page 1).")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(session_id, "What does my document say?")
+
+    assert result["answer"] == "Answer with citation (mine.pdf, page 1)."
+    assert result["trace"][0]["tool"] == "search_documents"
+    returned = result["trace"][0]["result"]["results"]
+    assert len(returned) == 1
+    assert returned[0]["filename"] == "mine.pdf"
+    assert returned[0]["page"] == 1
+    assert all(r["filename"] != "other.pdf" for r in returned)
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_skips_corrupted_row_without_crashing(mock_anthropic):
+    session_id = _session()
+    _insert_chunk_row(session_id, "doc-1", "a.pdf", 1, "corrupted row", "not valid json")
+    _insert_chunk_row(session_id, "doc-1", "a.pdf", 2, "good row", '[3.0, 0.0, 0.0]')
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "row"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(session_id, "Search my documents")
+
+    returned = result["trace"][0]["result"]["results"]
+    assert len(returned) == 1
+    assert returned[0]["text"] == "good row"
+
+
+@patch("app.agent.Anthropic")
+def test_search_documents_unconditionally_available_even_with_skill_scoping(
+        mock_anthropic, isolate_skills_dir):
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Only does arithmetic.",
+                 allowed_tools=["calculator"])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+    ask_aegis(_session(), "Use the demo skill")
+    _, second_call = mock_client.messages.create.call_args_list
+    assert "search_documents" in _tool_names(second_call)
