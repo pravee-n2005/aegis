@@ -13,16 +13,10 @@ from app.context import create_session  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def isolate_trace_file(tmp_path, monkeypatch):
-    """Keep test runs from appending to the real backend/workspace/.traces/traces.jsonl."""
-    monkeypatch.setattr(tracing, "TRACE_PATH", tmp_path / "traces.jsonl")
-
-
-@pytest.fixture(autouse=True)
 def isolate_skills_dir(tmp_path, monkeypatch):
     """Point skills_dir at an empty tmp directory by default, so every existing
     test exercises plain M1 behavior unless it explicitly writes a skill fixture
-    into this same directory. Mirrors isolate_trace_file's pattern."""
+    into this same directory. Mirrors conftest.py's isolate_trace_file pattern."""
     monkeypatch.setattr(settings, "skills_dir", str(tmp_path / "skills"))
     return tmp_path / "skills"
 
@@ -30,8 +24,8 @@ def isolate_skills_dir(tmp_path, monkeypatch):
 @pytest.fixture(autouse=True)
 def isolate_db(tmp_path, monkeypatch):
     """Point db_path at a fresh tmp file per test and initialize its schema -
-    mirrors isolate_trace_file's pattern so M3 state never touches the real
-    backend/.data/aegis.db or leaks between tests."""
+    mirrors conftest.py's isolate_trace_file pattern so M3 state never
+    touches the real backend/.data/aegis.db or leaks between tests."""
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "aegis.db"))
     db.init_db()
 
@@ -94,7 +88,7 @@ def test_successful_tool_execution(mock_anthropic):
     assert result["stop_reason"] == "end_turn"
     assert len(result["trace"]) == 1
     assert result["trace"][0]["tool"] == "calculator"
-    assert result["trace"][0]["result"] == {"result": 4}
+    assert result["trace"][0]["result"] == {"result": 4, "rounds_remaining": 3}
 
 
 @patch("app.agent.Anthropic")
@@ -177,7 +171,8 @@ def test_load_skill_scopes_tools_for_next_round(mock_anthropic, isolate_skills_d
     # that omits it excludes it, same as search_workspace.
     assert sorted(_tool_names(second_call)) == ["calculator"]
     assert result["trace"][0]["tool"] == "load_skill"
-    assert result["trace"][0]["result"] == {"instructions": "Follow these instructions."}
+    assert result["trace"][0]["result"] == {
+        "instructions": "Follow these instructions.", "rounds_remaining": 3}
 
 
 @patch("app.agent.Anthropic")
@@ -229,7 +224,8 @@ def test_second_load_skill_call_in_same_round_rejected(mock_anthropic, isolate_s
     mock_anthropic.return_value = mock_client
     result = ask_aegis(_session(), "Load two skills")
     first, second = result["trace"]
-    assert first["result"] == {"instructions": "Follow these instructions."}
+    assert first["result"] == {
+        "instructions": "Follow these instructions.", "rounds_remaining": 3}
     assert "error" in second["result"]
     assert "already loaded" in second["result"]["error"].lower()
 
@@ -585,3 +581,249 @@ def test_configured_openrouter_model_used_in_chat_call(mock_anthropic, monkeypat
 
     call = mock_client.messages.create.call_args
     assert call.kwargs["model"] == "some-org/some-model:free"
+
+
+# --- M5: agent-loop reliability (repeated-search problem, 2026-11-16) ---
+#
+# Live M4 testing showed the model spending all 4 tool rounds on
+# paraphrased search_documents queries against the same small document,
+# then hitting the round limit before ever synthesizing an answer. The fix
+# (agent.py's _run_tool and the main loop in ask_aegis) surfaces two
+# backend-computed, deterministic signals on every tool result instead of
+# a hardcoded "one call is enough" rule: `rounds_remaining` (how many more
+# tool rounds are left this turn) and, for search_documents specifically,
+# `new_chunk_count` / `distinct_pages_covered` (whether a follow-up query
+# actually surfaced anything not already retrieved this turn).
+
+@patch("app.agent.Anthropic")
+def test_sufficient_evidence_synthesizes_without_exhausting_round_budget(mock_anthropic):
+    """One search_documents call returning chunks across several pages is
+    enough evidence - the model (scripted here to answer immediately after
+    one call) must synthesize well before the 4-round budget is exhausted."""
+    session_id = _session()
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 2, "responsibilities: ...", '[3.0, 0.0, 0.0]')
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 3, "requirements: ...", '[3.0, 0.0, 0.0]')
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 4, "eligibility: ...", '[3.0, 0.0, 0.0]')
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "responsibilities and requirements"})], "tool_use"),
+        _response([_text_block("Responsibilities and requirements are on pages 2-4.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(session_id, "What are the key responsibilities and required skills?")
+
+    assert result["stop_reason"] == "end_turn"
+    assert len(result["trace"]) == 1
+    search_result = result["trace"][0]["result"]
+    assert search_result["new_chunk_count"] == 3
+    assert search_result["distinct_pages_covered"] == [2, 3, 4]
+    assert search_result["rounds_remaining"] == settings.max_tool_rounds - 1
+
+
+@patch("app.agent.Anthropic")
+def test_insufficient_evidence_allows_justified_followup_search(mock_anthropic):
+    """A first query that only surfaces one page is genuinely insufficient -
+    a second, differently-scoped query that surfaces NEW chunks on other
+    pages must be allowed and reflected with a nonzero new_chunk_count, not
+    suppressed by any "only one search" rule."""
+    session_id = _session()
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 2, "responsibilities: ...", '[3.0, 0.0, 0.0]')
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 5, "eligibility criteria: ...", '[5.0, 0.0, 0.0]')
+
+    def fake_search(session_id_, query, request_id=None):
+        # Simulate two distinct queries surfacing two distinct chunks, as a
+        # real embedding backend would for genuinely different sections.
+        from app import documents as _documents
+        rows = _documents.list_chunks(session_id_)
+        if "responsibilit" in query:
+            picked = [r for r in rows if r["page_number"] == 2]
+        else:
+            picked = [r for r in rows if r["page_number"] == 5]
+        return [{"chunk_id": r["id"], "filename": r["filename"], "page": r["page_number"],
+                 "text": r["content"], "score": 0.9} for r in picked]
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "responsibilities"}, block_id="t1")], "tool_use"),
+        _response([_tool_use_block("search_documents", {"query": "eligibility criteria"}, block_id="t2")], "tool_use"),
+        _response([_text_block("Responsibilities on page 2, eligibility on page 5.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    with patch("app.agent.retrieval.search", side_effect=fake_search):
+        result = ask_aegis(session_id, "What are the responsibilities and eligibility criteria?")
+
+    assert result["stop_reason"] == "end_turn"
+    assert len(result["trace"]) == 2
+    assert result["trace"][0]["result"]["new_chunk_count"] == 1
+    assert result["trace"][1]["result"]["new_chunk_count"] == 1
+    assert result["trace"][1]["result"]["distinct_pages_covered"] == [5]
+
+
+@patch("app.agent.Anthropic")
+def test_redundant_search_reports_zero_new_chunks(mock_anthropic):
+    """Two calls returning the exact same chunk (a paraphrased, redundant
+    query) must report new_chunk_count == 0 on the second call - the
+    objective "you already have this" signal the model is told to act on,
+    instead of brittle keyword-based query comparison."""
+    session_id = _session()
+    _insert_chunk_row(session_id, "doc-1", "jd.pdf", 2, "responsibilities: ...", '[3.0, 0.0, 0.0]')
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "responsibilities"}, block_id="t1")], "tool_use"),
+        _response([_tool_use_block("search_documents", {"query": "what you will do"}, block_id="t2")], "tool_use"),
+        _response([_text_block("Responsibilities are on page 2.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(session_id, "What are the key responsibilities?")
+
+    assert len(result["trace"]) == 2
+    assert result["trace"][0]["result"]["new_chunk_count"] == 1
+    assert result["trace"][1]["result"]["new_chunk_count"] == 0
+    assert result["trace"][1]["result"]["rounds_remaining"] == settings.max_tool_rounds - 2
+
+
+@patch("app.agent.Anthropic")
+def test_tool_error_still_carries_rounds_remaining(mock_anthropic):
+    """A failing tool call (calculator rejecting an unsafe expression) must
+    still carry rounds_remaining - the budget signal is unconditional, not
+    only attached to successful calls."""
+    mock_client = _mock_client([
+        _response([_tool_use_block("calculator", {"expression": "__import__('os')"})], "tool_use"),
+        _response([_text_block("I could not evaluate that expression.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(_session(), "Run some code for me")
+
+    assert "error" in result["trace"][0]["result"]
+    assert result["trace"][0]["result"]["rounds_remaining"] == settings.max_tool_rounds - 1
+
+
+@patch("app.agent.Anthropic")
+def test_max_round_exhaustion_shows_decreasing_rounds_remaining(mock_anthropic):
+    """Regression: the hard round-limit safety bound is untouched by the
+    new signals - four forced tool rounds still hit tool_round_limit, and
+    rounds_remaining counts down to 0 on the final one, never negative."""
+    tool_round = _response([_tool_use_block("calculator", {"expression": "1 + 1"})], "tool_use")
+    mock_anthropic.return_value = _mock_client([tool_round] * settings.max_tool_rounds)
+
+    result = ask_aegis(_session(), "Keep calculating forever")
+
+    assert result["stop_reason"] == "tool_round_limit"
+    assert len(result["trace"]) == settings.max_tool_rounds
+    observed = [entry["result"]["rounds_remaining"] for entry in result["trace"]]
+    assert observed == list(range(settings.max_tool_rounds - 1, -1, -1))
+
+
+# --- M5: tool scope is enforced server-side, not just advertised (security hardening, 2026-11-16) ---
+#
+# Prior to this fix, a skill's allowed-tools list only controlled the
+# `tools=` list OFFERED to the model (scope_tools/scope_tools_by_names) -
+# _run_tool's dispatch had no check of its own. A response naming a tool
+# outside that scope (a non-compliant provider response, a model error, or
+# a document successfully steering the model to request a tool it was
+# never offered) still reached dispatch and executed. These tests prove
+# the gate added to _run_tool (the allowed_tool_names check) actually
+# blocks execution, not just the advertisement.
+
+@patch("app.agent.safe_calculate")
+@patch("app.agent.Anthropic")
+def test_tool_call_outside_deny_all_skill_scope_is_not_executed(mock_anthropic, mock_safe_calculate, isolate_skills_dir):
+    """A deny-all skill is loaded (no tools offered after it loads), but
+    the scripted model calls calculator anyway in the next round. The real
+    safe_calculate must never run, and the result must be an error, not a
+    computed value."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Deny-all skill.", allowed_tools=[])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_tool_use_block("calculator", {"expression": "1 + 1"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(_session(), "Use the demo skill then calculate")
+
+    mock_safe_calculate.assert_not_called()
+    assert result["trace"][1]["tool"] == "calculator"
+    assert "error" in result["trace"][1]["result"]
+    assert "scope" in result["trace"][1]["result"]["error"].lower()
+
+
+@patch("app.agent.search_workspace")
+@patch("app.agent.Anthropic")
+def test_tool_call_excluded_by_partial_allowlist_is_not_executed(mock_anthropic, mock_search_workspace, isolate_skills_dir):
+    """A skill allowlists only calculator; the scripted model calls
+    search_workspace anyway. search_workspace must never run."""
+    _write_skill(isolate_skills_dir, "demo", "demo-skill", "Arithmetic-only skill.",
+                 allowed_tools=["calculator"])
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "demo-skill"})], "tool_use"),
+        _response([_tool_use_block("search_workspace", {"query": "secrets"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(_session(), "Use the demo skill")
+
+    mock_search_workspace.assert_not_called()
+    assert "error" in result["trace"][1]["result"]
+
+
+@patch("app.agent.Anthropic")
+def test_load_skill_still_works_under_its_own_deny_all_scope(mock_anthropic, isolate_skills_dir):
+    """Regression: the out-of-scope gate must not block load_skill itself -
+    a session must always be able to call load_skill to switch away from a
+    deny-all scope (M3's "not a permanent lock" guarantee)."""
+    _write_skill(isolate_skills_dir, "a", "skill-a", "Deny-all.", allowed_tools=[])
+    _write_skill(isolate_skills_dir, "b", "skill-b", "Unrestricted.")
+    mock_client = _mock_client([
+        _response([_tool_use_block("load_skill", {"name": "skill-a"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(_session(), "Load skill a")
+
+    assert result["trace"][0]["tool"] == "load_skill"
+    assert "instructions" in result["trace"][0]["result"]
+
+
+# --- M5: sensitive data exposure through traces (gap fill, 2026-11-16) ---
+
+@patch("app.agent.Anthropic")
+def test_tool_call_trace_record_never_contains_raw_document_content(mock_anthropic):
+    """write_trace("tool_call", ...) in agent.py logs only ok/input_length/
+    result_length - never the raw tool input or result. This pins that
+    guarantee against regression: a secret-looking marker present in a
+    retrieved chunk's actual text must never appear in the on-disk trace
+    file, even though it legitimately appears in the in-process result
+    returned to the caller (result["trace"], asserted separately)."""
+    session_id = _session()
+    secret_marker = "SSN-900-11-2222-DO-NOT-LOG-THIS"
+    _insert_chunk_row(session_id, "doc-1", "sensitive.pdf", 1, secret_marker, '[3.0, 0.0, 0.0]')
+
+    mock_client = _mock_client([
+        _response([_tool_use_block("search_documents", {"query": "content"})], "tool_use"),
+        _response([_text_block("Done.")], "end_turn"),
+    ])
+    mock_anthropic.return_value = mock_client
+
+    result = ask_aegis(session_id, "What does my document say?")
+
+    # The in-process result (never persisted/logged) legitimately carries
+    # the real content - that's the RAG feature working as designed.
+    assert secret_marker in result["trace"][0]["result"]["results"][0]["text"]
+
+    trace_file_text = tracing.TRACE_PATH.read_text()
+    assert secret_marker not in trace_file_text
+    import json
+    records = [json.loads(line) for line in trace_file_text.splitlines()]
+    tool_call_records = [r for r in records if r["event"] == "tool_call"]
+    assert tool_call_records
+    for record in tool_call_records:
+        assert "input" not in record
+        assert "result" not in record
+        assert set(record) >= {"request_id", "timestamp", "event", "tool", "ok",
+                                "input_length", "result_length"}

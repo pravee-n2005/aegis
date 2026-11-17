@@ -13,6 +13,7 @@ from .skills import (
 )
 
 EVENT_SENSITIVE_TOOL_DENIED = "sensitive_tool_denied_after_document_content"
+EVENT_TOOL_OUT_OF_SCOPE_DENIED = "tool_out_of_scope_denied"
 
 # Backend-enforced tool-authorization gate (M4 security hardening,
 # 2026-11-15): once search_documents has returned content from an
@@ -36,7 +37,14 @@ SYSTEM_PROMPT = (
     "is insufficient, say so. When you answer using search_documents results, "
     "cite the (filename, page) pairs the tool result actually contains - never "
     "invent a filename or page number. If search_documents returns no relevant "
-    "matches, say the evidence is insufficient rather than guessing."
+    "matches, say the evidence is insufficient rather than guessing. "
+    "Every tool result includes 'rounds_remaining', the number of further "
+    "tool-use rounds you have left this turn; when it reaches 0 you must answer "
+    "now from the evidence already gathered instead of calling another tool. "
+    "search_documents results also include 'new_chunk_count': if a follow-up "
+    "search returns 0 new chunks, your earlier searches already retrieved this "
+    "evidence - stop searching and synthesize an answer instead of rephrasing "
+    "the same query again."
 )
 
 SEARCH_DOCUMENTS_TOOL = {
@@ -64,7 +72,23 @@ TOOLS = [
     SEARCH_DOCUMENTS_TOOL,
 ]
 
-def _run_tool(name, args, request_id, skill_ctx, session_id, trust_ctx):
+def _run_tool(name, args, request_id, skill_ctx, session_id, trust_ctx, allowed_tool_names):
+    # Backend-enforced scope gate (M5 security hardening, 2026-11-16): the
+    # skill-scoped `tools=` list sent to the model only controls what a
+    # well-behaved model *offers to call* - it is advice to the model, not
+    # an authorization boundary the server itself enforces. Without this
+    # check, a response that names a tool outside the current scope (a
+    # model error, a non-compliant/adversarial provider response, or a
+    # malicious document successfully steering the model to request a
+    # tool it was never offered) still reaches dispatch and executes,
+    # silently defeating skill-based tool scoping. This re-checks the same
+    # allowlist the API call was actually made with, in code, every call -
+    # load_skill is exempt because it is always offered separately
+    # whenever skills exist (see TOOLS/current_tools construction below).
+    if name != "load_skill" and name not in allowed_tool_names:
+        write_trace(EVENT_TOOL_OUT_OF_SCOPE_DENIED, request_id, tool=name,
+                    allowed_tools=sorted(allowed_tool_names))
+        return {"error": f"{name} is outside the current tool scope and was not executed."}
     if name in SENSITIVE_TOOLS_AFTER_DOCUMENT_CONTENT and trust_ctx["document_content_seen"]:
         write_trace(EVENT_SENSITIVE_TOOL_DENIED, request_id, tool=name)
         return {"error": f"{name} is unavailable for the rest of this turn because "
@@ -86,7 +110,19 @@ def _run_tool(name, args, request_id, skill_ctx, session_id, trust_ctx):
             return {"error": "document search is temporarily unavailable, try again shortly",
                     "degraded": True}
         trust_ctx["document_content_seen"] = True
-        return {"results": results}
+        # Agent-loop reliability fix (M5, 2026-11-16): tag how many of this
+        # call's chunks were not already surfaced earlier in the same turn.
+        # Backend-computed from chunk identity (never text/keyword matching),
+        # so repeated reformulated queries against a small document get an
+        # objective "you already have this" signal instead of the model
+        # having to infer overlap from re-reading each result's text. See
+        # the "rounds_remaining" / "new_chunk_count" paragraph in SYSTEM_PROMPT.
+        seen = trust_ctx["seen_chunk_ids"]
+        new_chunk_count = sum(1 for r in results if r["chunk_id"] not in seen)
+        distinct_pages_covered = sorted({r["page"] for r in results})
+        seen.update(r["chunk_id"] for r in results)
+        return {"results": results, "new_chunk_count": new_chunk_count,
+                "distinct_pages_covered": distinct_pages_covered}
     if name == "load_skill":
         outcome = load_skill(args["name"], skill_ctx["skills"], skill_ctx["loaded"])
         write_trace(EVENT_LOADED, request_id, reason=outcome["reason"], name=args["name"])
@@ -129,7 +165,7 @@ def ask_aegis(session_id, message, history=None):
     context.append_message(session_id, "user", message, request_id=request_id)
     system_prompt_addition, messages = context.build_context(session_id, request_id=request_id)
     trace = []
-    trust_ctx = {"document_content_seen": False}
+    trust_ctx = {"document_content_seen": False, "seen_chunk_ids": set()}
     degraded_tools = []
 
     known_tools = {tool["name"] for tool in TOOLS}
@@ -168,7 +204,17 @@ def ask_aegis(session_id, message, history=None):
         return {"answer": answer_text, "trace": trace, "stop_reason": stop_reason,
                 "degraded_tools": degraded_tools}
 
-    for _ in range(settings.max_tool_rounds):
+    for round_num in range(settings.max_tool_rounds):
+        # Rounds left for *further* tool use after this one. Surfaced to the
+        # model on every tool result (not just search_documents) as objective,
+        # backend-computed data - the model no longer has to guess its own
+        # budget. When this hits 0, the next model response must be the final
+        # answer: there is no round left to call another tool in.
+        rounds_remaining = settings.max_tool_rounds - round_num - 1
+        # Snapshot of the scope actually offered to the model THIS round -
+        # used below to re-check every tool_use the model returns against
+        # the same scope, in code (see _run_tool's allowed_tool_names gate).
+        allowed_tool_names = {tool["name"] for tool in current_tools}
         create_kwargs = {"model": settings.openrouter_model, "max_tokens": 1200,
                           "system": system_prompt, "messages": messages}
         if current_tools:
@@ -189,9 +235,11 @@ def ask_aegis(session_id, message, history=None):
             if getattr(block, "type", None) != "tool_use":
                 continue
             try:
-                result = _run_tool(block.name, block.input, request_id, skill_ctx, session_id, trust_ctx)
+                result = _run_tool(block.name, block.input, request_id, skill_ctx, session_id,
+                                    trust_ctx, allowed_tool_names)
             except Exception as exc:
                 result = {"error": str(exc)}
+            result["rounds_remaining"] = rounds_remaining
             if result.get("degraded"):
                 degraded_tools.append(block.name)
             trace.append({"tool": block.name, "input": block.input, "result": result})

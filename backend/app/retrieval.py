@@ -90,7 +90,7 @@ def search(session_id: str, query: str, top_k: int = DEFAULT_TOP_K,
                 below_threshold_count=below_threshold, threshold=threshold)
 
     return [
-        {"filename": row["filename"], "page": row["page_number"],
+        {"chunk_id": row["id"], "filename": row["filename"], "page": row["page_number"],
          "text": row["content"], "score": score}
         for score, row in top
     ]

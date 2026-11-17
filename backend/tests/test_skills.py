@@ -1,13 +1,9 @@
 import json
 
-import pytest
-
 from app import skills, tracing
 
-
-@pytest.fixture(autouse=True)
-def isolate_trace_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tracing, "TRACE_PATH", tmp_path / "traces.jsonl")
+# TRACE_PATH isolation comes from conftest.py's autouse isolate_trace_file
+# fixture.
 
 
 def _write_skill(base, dirname, frontmatter, body="Body text.", encoding="utf-8"):

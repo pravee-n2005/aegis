@@ -8,7 +8,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
 
-from app import context, db, tracing  # noqa: E402
+from app import context, db  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -31,7 +31,10 @@ def _mock_client(responses):
 
 @pytest.fixture(autouse=True)
 def isolate_trace_and_skills(tmp_path, monkeypatch):
-    monkeypatch.setattr(tracing, "TRACE_PATH", tmp_path / "traces.jsonl")
+    """TRACE_PATH isolation now comes from conftest.py's autouse
+    isolate_trace_file fixture; this fixture keeps its name (tests pass it
+    explicitly to get the skills tmp dir back) and its skills_dir/db_path
+    isolation."""
     monkeypatch.setattr(settings, "skills_dir", str(tmp_path / "skills"))
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "aegis.db"))
     db.init_db()
@@ -397,3 +400,26 @@ def test_maybe_summarize_chaos_partial_write_never_half_applies(monkeypatch):
     conn.close()
     assert row["summarized"] == 0, "messages must not be marked summarized if the update failed"
     assert summary_row is None, "the summary insert must have rolled back alongside the failed update"
+
+
+# --- M5: provider failure mapping (security/reliability gap fill, 2026-11-16) ---
+
+def test_chat_provider_api_error_maps_to_502():
+    """A raw anthropic.APIError escaping ask_aegis (e.g. OpenRouter/the
+    upstream provider erroring on the main chat call, not just the
+    best-effort summarization path already covered elsewhere) must map to
+    a 502, never a bare 500 that could leak an unhandled traceback."""
+    import anthropic
+
+    class _FakeAPIError(anthropic.APIError):
+        def __init__(self, message):
+            Exception.__init__(self, message)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = _FakeAPIError("upstream boom")
+
+    with patch("app.agent.Anthropic", return_value=mock_client):
+        response = client.post("/api/chat", json={"message": "Hi"})
+
+    assert response.status_code == 502
+    assert "upstream boom" not in response.json()["detail"]

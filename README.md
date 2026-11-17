@@ -1,6 +1,6 @@
 # AEGIS — Engineering Intelligence Workbench
 
-Starter backend for Milestone 1: a Claude-powered assistant with a bounded tool-use loop, safe calculator, read-only local workspace search, and execution trace. Milestone 4 adds document upload and retrieval-augmented question answering, grounded with filename+page citations.
+Starter backend for Milestone 1: a Claude-powered assistant with a bounded tool-use loop, safe calculator, read-only local workspace search, and execution trace. Milestone 4 adds document upload and retrieval-augmented question answering, grounded with filename+page citations. Milestone 5 adds a deterministic offline evaluation suite for retrieval/citation quality, an agent-loop reliability fix for the repeated-search problem observed in live M4 testing, and additional adversarial/security tests — see [docs/EVALUATION.md](docs/EVALUATION.md) and [docs/SECURITY.md](docs/SECURITY.md).
 
 This is a learning starter, not a production-ready SaaS. Authentication, multi-tenancy, frontend, LangGraph, and MCP are later milestones.
 
@@ -27,6 +27,11 @@ Test:
 ```bash
 pytest -q
 ```
+This includes `tests/test_eval.py`, a deterministic regression gate wired from the M5 evaluation suite — fully offline (fake embeddings, scripted LLM), no API key or model download needed. Run the standalone evaluation report (same harness, human-readable or `--json` output) with:
+```bash
+python -m eval.run_eval
+```
+See [docs/EVALUATION.md](docs/EVALUATION.md) for what it measures, its limitations, and how to add cases.
 
 Example request:
 ```bash
@@ -84,6 +89,18 @@ incomplete evidence, rather than relying on the model's wording alone.
 
 None of this amounts to complete prompt-injection protection or
 production-grade multi-tenant security — see the caveats above and in
-`docs/designs/m4-rag-document-intelligence.md`.
+`docs/designs/m4-rag-document-intelligence.md` and `docs/SECURITY.md`.
+
+### Agent-loop reliability (M5)
+
+Live M4 testing showed the agent spending all 4 tool rounds on paraphrased
+`search_documents` queries against the same small document, then hitting the
+round limit before ever synthesizing an answer. Every tool result now carries
+a backend-computed `rounds_remaining` count, and `search_documents` results
+additionally carry `new_chunk_count` / `distinct_pages_covered` — objective
+signals (never a hardcoded "one search is enough" rule) that let the model
+recognize when a follow-up query is actually redundant versus genuinely
+surfacing new evidence. `max_tool_rounds` (default `4`) is unchanged and
+remains the hard safety bound. See `docs/designs/m5-evaluation-reliability-security.md`.
 
 Never commit `.env`. Workspace search is read-only and limited to Markdown/text files under `backend/workspace`. Do not expose the API publicly without authentication, rate limits, and authorization.

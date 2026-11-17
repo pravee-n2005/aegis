@@ -7,7 +7,7 @@ from fastapi.testclient import TestClient
 
 os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
 
-from app import context, db, documents, embeddings, tracing  # noqa: E402
+from app import context, db, documents, embeddings  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.main import app  # noqa: E402
 
@@ -16,7 +16,9 @@ client = TestClient(app)
 
 @pytest.fixture(autouse=True)
 def isolate_trace_and_db(tmp_path, monkeypatch):
-    monkeypatch.setattr(tracing, "TRACE_PATH", tmp_path / "traces.jsonl")
+    """TRACE_PATH isolation now comes from conftest.py's autouse
+    isolate_trace_file fixture; this fixture keeps its skills_dir/db_path
+    isolation."""
     monkeypatch.setattr(settings, "skills_dir", str(tmp_path / "skills"))
     monkeypatch.setattr(settings, "db_path", str(tmp_path / "aegis.db"))
     db.init_db()
@@ -254,4 +256,65 @@ def test_upload_then_chat_question_gets_insufficient_evidence_style_answer():
     body = response.json()
     assert "insufficient evidence" in body["answer"].lower()
     assert body["trace"][0]["tool"] == "search_documents"
+    assert body["trace"][0]["result"]["results"] == []
+
+
+# --- M5: cross-session document isolation at the API layer (gap fill, 2026-11-16) ---
+#
+# documents.py / retrieval.py already have unit-level cross-session
+# isolation tests (test_documents.py, test_retrieval.py). These exercise
+# the same guarantees through the real HTTP endpoints and the real chat
+# pipeline end to end, since an endpoint-level or chat-pipeline-level
+# regression (e.g. a route reading the wrong session_id) would not be
+# caught by a unit test that calls documents.py/retrieval.py directly.
+
+def test_delete_document_from_different_session_returns_404_not_success():
+    """Session B must not be able to delete session A's document by id,
+    even though document ids are globally unique and B knows a valid one -
+    the delete must be scoped by (document_id AND session_id)."""
+    owner_session = _session()
+    attacker_session = _session()
+    upload = client.post(f"/api/sessions/{owner_session}/documents",
+                          files={"file": ("mine.pdf", _make_pdf("secret"), "application/pdf")})
+    document_id = upload.json()["document_id"]
+
+    response = client.delete(f"/api/sessions/{attacker_session}/documents/{document_id}")
+
+    assert response.status_code == 404
+    assert documents.list_documents(owner_session)[0]["document_id"] == document_id
+
+
+def test_chat_in_one_session_cannot_retrieve_another_sessions_document_content():
+    """End-to-end cross-session RAG isolation through the real chat
+    endpoint: session B asks a question and the real search_documents tool
+    call must return nothing from session A's uploaded document, even
+    though both sessions share the same process and database file."""
+    session_a = _session()
+    session_b = _session()
+    client.post(f"/api/sessions/{session_a}/documents",
+                files={"file": ("confidential.pdf", _make_pdf("top secret payroll data"), "application/pdf")})
+
+    def _text_block(text):
+        return types.SimpleNamespace(type="text", text=text,
+                                      model_dump=lambda: {"type": "text", "text": text})
+
+    def _tool_use_block(name, input_, block_id="tool_1"):
+        return types.SimpleNamespace(type="tool_use", name=name, input=input_, id=block_id,
+                                      model_dump=lambda: {"type": "tool_use", "name": name,
+                                                           "input": input_, "id": block_id})
+
+    def _response(content, stop_reason):
+        return types.SimpleNamespace(content=content, stop_reason=stop_reason)
+
+    mock_client = MagicMock()
+    mock_client.messages.create.side_effect = [
+        _response([_tool_use_block("search_documents", {"query": "payroll data"})], "tool_use"),
+        _response([_text_block("I have no document content to answer that from.")], "end_turn"),
+    ]
+    with patch("app.agent.Anthropic", return_value=mock_client):
+        response = client.post("/api/chat", json={"message": "What does the payroll document say?",
+                                                    "session_id": session_b})
+
+    assert response.status_code == 200
+    body = response.json()
     assert body["trace"][0]["result"]["results"] == []

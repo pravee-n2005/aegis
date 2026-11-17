@@ -1,14 +1,10 @@
 import json
 from pathlib import Path
 
-import pytest
-
 from app import tracing
 
-
-@pytest.fixture(autouse=True)
-def isolate_trace_file(tmp_path, monkeypatch):
-    monkeypatch.setattr(tracing, "TRACE_PATH", tmp_path / "traces.jsonl")
+# TRACE_PATH isolation comes from conftest.py's autouse isolate_trace_file
+# fixture.
 
 
 def test_write_trace_appends_jsonl_record():
