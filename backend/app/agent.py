@@ -4,7 +4,7 @@ from . import context
 from . import embeddings
 from . import memory
 from . import retrieval
-from .config import settings
+from .config import settings, OPENROUTER_BASE_URL
 from .tools import safe_calculate, search_workspace
 from .tracing import content_length, new_request_id, write_trace
 from .skills import (
@@ -112,7 +112,18 @@ def _seed_history_if_empty(session_id, history, request_id):
 
 def ask_aegis(session_id, message, history=None):
     request_id = new_request_id()
-    client = Anthropic(api_key=settings.anthropic_api_key)
+    # auth_token=, not api_key=: OpenRouter's Anthropic-compatible endpoint
+    # requires "Authorization: Bearer <key>" (verified against its OpenAPI
+    # spec, 2026-11-15 - its securitySchemes.apiKey entry is HTTP bearer,
+    # not a custom header). On the anthropic SDK version this project
+    # pins as a floor (0.40.0, verified directly against that wheel's
+    # _client.py), api_key= sends "X-Api-Key" instead, which OpenRouter's
+    # endpoint does not read - auth_token= is the one path confirmed to
+    # send the right header across the whole >=0.40.0 range this
+    # project supports (newer SDK versions happen to send Bearer for
+    # api_key= too, but relying on that would silently break again on
+    # the pinned floor).
+    client = Anthropic(auth_token=settings.openrouter_api_key, base_url=OPENROUTER_BASE_URL)
 
     _seed_history_if_empty(session_id, history, request_id)
     context.append_message(session_id, "user", message, request_id=request_id)
@@ -158,7 +169,7 @@ def ask_aegis(session_id, message, history=None):
                 "degraded_tools": degraded_tools}
 
     for _ in range(settings.max_tool_rounds):
-        create_kwargs = {"model": settings.anthropic_model, "max_tokens": 1200,
+        create_kwargs = {"model": settings.openrouter_model, "max_tokens": 1200,
                           "system": system_prompt, "messages": messages}
         if current_tools:
             # Omit `tools` entirely rather than pass [] — some SDKs/APIs treat

@@ -4,7 +4,7 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-os.environ.setdefault("ANTHROPIC_API_KEY", "test-key")
+os.environ.setdefault("OPENROUTER_API_KEY", "test-key")
 
 from app import db, tracing  # noqa: E402
 from app.agent import ask_aegis, TOOLS  # noqa: E402
@@ -551,3 +551,37 @@ def test_embedding_failure_sanitized_and_flagged_degraded(mock_anthropic):
     assert "/home/user/.cache" not in tool_error
     assert "huggingface" not in tool_error.lower()
     assert "unavailable" in tool_error.lower()
+
+
+# --- OpenRouter provider configuration (provider migration, 2026-11-15) ---
+
+@patch("app.agent.Anthropic")
+def test_client_configured_with_openrouter_base_url_and_auth_token(mock_anthropic, monkeypatch):
+    """The Anthropic SDK client must be constructed with OpenRouter's base
+    URL and auth_token= (not api_key=) - OpenRouter's Anthropic-compatible
+    endpoint requires "Authorization: Bearer", which is what auth_token=
+    sends on every anthropic SDK version >=0.40.0 this project supports;
+    api_key= only started doing that in much newer SDK releases."""
+    from app.config import OPENROUTER_BASE_URL
+    monkeypatch.setattr(settings, "openrouter_api_key", "sk-or-test-key")
+    mock_client = _mock_client([_response([_text_block("Hi.")], "end_turn")])
+    mock_anthropic.return_value = mock_client
+
+    ask_aegis(_session(), "Hello")
+
+    _, call_kwargs = mock_anthropic.call_args
+    assert call_kwargs["base_url"] == OPENROUTER_BASE_URL
+    assert call_kwargs["auth_token"] == "sk-or-test-key"
+    assert "api_key" not in call_kwargs
+
+
+@patch("app.agent.Anthropic")
+def test_configured_openrouter_model_used_in_chat_call(mock_anthropic, monkeypatch):
+    monkeypatch.setattr(settings, "openrouter_model", "some-org/some-model:free")
+    mock_client = _mock_client([_response([_text_block("Hi.")], "end_turn")])
+    mock_anthropic.return_value = mock_client
+
+    ask_aegis(_session(), "Hello")
+
+    call = mock_client.messages.create.call_args
+    assert call.kwargs["model"] == "some-org/some-model:free"

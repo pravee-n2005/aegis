@@ -263,7 +263,7 @@ def maybe_summarize(session_id: str, client, request_id: str = None) -> bool:
     transcript = "\n".join(f"{r['role']}: {_flatten_for_summary(json.loads(r['content']))}" for r in rows)
     try:
         response = client.messages.create(
-            model=settings.anthropic_model,
+            model=settings.openrouter_model,
             max_tokens=400,
             messages=[{"role": "user", "content":
                        "Summarize the following conversation concisely, preserving key "

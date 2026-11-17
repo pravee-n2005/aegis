@@ -13,7 +13,7 @@ python -m pip install --upgrade pip
 pip install -r requirements.txt
 cp .env.example .env
 ```
-Add your Anthropic API key to `.env`. Claude Pro does not include API credits; API usage is billed separately. Set `ANTHROPIC_MODEL` to a model ID enabled for your API account.
+Add your [OpenRouter](https://openrouter.ai/keys) API key to `.env` as `OPENROUTER_API_KEY`. The app talks to OpenRouter through the Anthropic Python SDK's Anthropic-Messages-compatible endpoint (`base_url=https://openrouter.ai/api`), not Anthropic's own API directly. `OPENROUTER_MODEL` defaults to a free OpenRouter model (`nvidia/nemotron-3-ultra-550b-a55b:free` at the time this was written — OpenRouter's free-model lineup rotates, so check [openrouter.ai/models?q=free](https://openrouter.ai/models?q=free) if it stops resolving) and can be set to any OpenRouter model ID enabled for your account.
 
 The first PDF upload downloads the local embedding model (`sentence-transformers/all-MiniLM-L6-v2`, ~90MB) to `~/.cache/huggingface`. This needs network access once; every upload after that runs fully offline.
 
